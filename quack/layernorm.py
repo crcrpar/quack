@@ -64,6 +64,7 @@ class LayerNorm(ReductionBase):
         self,
         mX: cute.Tensor,
         mW: cute.Tensor,
+        mB: cute.Tensor,
         mO: cute.Tensor,
         mRstd: Optional[cute.Tensor],
         mMean: Optional[cute.Tensor],
@@ -78,6 +79,8 @@ class LayerNorm(ReductionBase):
         num_warps = num_threads // cute.arch.WARP_SIZE
         mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
         mW = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mB_expanded_layout = cute.prepend(mB.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
+        mB = cute.make_tensor(mB.iterator, mB_expanded_layout)
         if cutlass.const_expr(mRstd is not None):
             mRstd_expanded_layout = cute.append(
                 mRstd.layout, cute.make_layout((self.N,), stride=(0,))
@@ -88,7 +91,9 @@ class LayerNorm(ReductionBase):
                 mMean.layout, cute.make_layout((self.N,), stride=(0,))
             )
             mMean = cute.make_tensor(mMean.iterator, mMean_expanded_layout)
-        self.kernel(mX, mW, mO, mRstd, mMean, eps, tv_layout, tiler_mn, self.reload_from).launch(
+        self.kernel(
+            mX, mW, mB, mO, mRstd, mMean, eps, tv_layout, tiler_mn, self.reload_from
+        ).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if cutlass.const_expr(self.cluster_n > 1) else None,
@@ -101,6 +106,7 @@ class LayerNorm(ReductionBase):
         self,
         mX: cute.Tensor,
         mW: cute.Tensor,
+        mB: cute.Tensor,
         mO: cute.Tensor,
         mRstd: Optional[cute.Tensor],
         mMean: Optional[cute.Tensor],
@@ -131,6 +137,7 @@ class LayerNorm(ReductionBase):
         gX, gO = [cute.local_tile(mT, tiler_mn, (0, cluster_y)) for mT in (mX, mO)]
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y))
+        gB = cute.local_tile(mB, tiler_mn, (0, cluster_y))
         gRstd = (
             cute.local_tile(mRstd, tiler_mn, (bidx, cluster_y))
             if cutlass.const_expr(mRstd is not None)
@@ -152,6 +159,9 @@ class LayerNorm(ReductionBase):
         copy_atom_load_W = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mW.element_type, num_bits_per_copy=128
         )
+        copy_atom_load_B = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=128
+        )
         copy_atom_store_O = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mO.element_type, num_bits_per_copy=128
         )
@@ -160,9 +170,11 @@ class LayerNorm(ReductionBase):
             tidx
         )
         thr_copy_W = cute.make_tiled_copy(copy_atom_load_W, tv_layout, tiler_mn).get_slice(tidx)
+        thr_copy_B = cute.make_tiled_copy(copy_atom_load_B, tv_layout, tiler_mn).get_slice(tidx)
         thr_copy_O = cute.make_tiled_copy(copy_atom_store_O, tv_layout, tiler_mn).get_slice(tidx)
 
         tWgW = thr_copy_W.partition_S(gW)
+        tBgB = thr_copy_B.partition_S(gB)
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
         tXgO = thr_copy_O.partition_D(gO)
@@ -172,7 +184,9 @@ class LayerNorm(ReductionBase):
 
         # allocate fragments for gmem->rmem
         tWrW = cute.make_fragment_like(tWgW)
+        tBrB = cute.make_fragment_like(tBgB)
         tXrW = thr_copy_X.retile(tWrW)
+        tXrB = thr_copy_X.retile(tBrB)
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
@@ -185,8 +199,10 @@ class LayerNorm(ReductionBase):
         cute.arch.cp_async_commit_group()
 
         tWpW = utils.predicate_k(thr_copy_W.partition_S(cX), limit=shape[1])
+        tBpB = utils.predicate_k(thr_copy_B.partition_S(cX), limit=shape[1])
         if cutlass.const_expr(not delay_w_load):
             cute.copy(copy_atom_load_W, tWgW, tWrW, pred=tWpW)
+            cute.copy(copy_atom_load_B, tBgB, tBrB, pred=tBpB)
 
         cute.arch.cp_async_wait_group(0)
         cute.autovec_copy(tXsX, tXrX)
@@ -244,7 +260,8 @@ class LayerNorm(ReductionBase):
             x = tXrX.load().to(cute.Float32)
         x_hat = (x - mean) * rstd
         w = tXrW.load().to(cute.Float32)
-        y = x_hat * w
+        b = tXrB.load().to(cute.Float32)
+        y = x_hat * w + b
         tXrO.store(y.to(tXrO.element_type))
         tOpO = utils.predicate_k(thr_copy_O.partition_S(cX), limit=shape[1])
         if row < shape[0]:
@@ -254,6 +271,7 @@ class LayerNorm(ReductionBase):
 def layernorm(
     x: torch.Tensor,
     weight: torch.Tensor,
+    bias: torch.Tensor,
     eps: float = 1e-6,
     return_rstd: bool = False,
     return_mean: bool = False,
@@ -263,6 +281,7 @@ def layernorm(
     Args:
         x: Input tensor of shape (M, N)
         weight: Weight tensor of shape (N,)
+        bias: Bias tensor of shape (N,)
         eps: Small value for numerical stability
         return_rstd: Whether to return the reciprocal standard deviation
         return_mean: Whether to return the mean
@@ -274,10 +293,12 @@ def layernorm(
     """
     assert x.dim() == 2, "Input must be 2D"
     assert weight.dim() == 1, "Weight must be 1D"
+    assert bias.dim() == 1, "Bias must be 1D"
     assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
     assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert weight.dtype == torch.float32, "Weight must be float32"
+    assert bias.dtype == torch.float32, "Bias must be float32"
     M, N = x.shape
     device = x.device
     out = torch.empty_like(x)
@@ -297,6 +318,9 @@ def layernorm(
     weight_tensor = utils.convert_from_dlpack(
         weight.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width
     )
+    bias_tensor = utils.convert_from_dlpack(
+        bias.detach(), leading_dim=0, divisibility=128 // cutlass.Float32.width
+    )
     rstd_tensor = (
         from_dlpack(rstd.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
         if rstd is not None
@@ -315,13 +339,21 @@ def layernorm(
             rmsnorm_op,
             x_tensor,
             weight_tensor,
+            bias_tensor,
             out_tensor,
             rstd_tensor,
             mean_tensor,
             current_stream,
         )
     layernorm.compile_cache[compile_key](
-        x_tensor, weight_tensor, out_tensor, rstd_tensor, mean_tensor, current_stream, eps
+        x_tensor,
+        weight_tensor,
+        bias_tensor,
+        out_tensor,
+        rstd_tensor,
+        mean_tensor,
+        current_stream,
+        eps,
     )
     return (
         (out, rstd, mean)
@@ -337,9 +369,9 @@ def layernorm(
 layernorm.compile_cache = {}
 
 
-def layernorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+def layernorm_ref(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float = 1e-6):
     x_f32 = x.float()
-    return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
+    return torch.nn.functional.layer_norm(x_f32, w.shape, w, b, eps).to(x.dtype)
 
 
 def rstd_ref(x: torch.Tensor, eps: float = 1e-6):
